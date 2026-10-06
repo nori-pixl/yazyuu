@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MID → Aoudio Script 変換</title>
+<style>
+:root{--ink:#1b2431;--acc:#2f6bff;--mut:#7d8ca1}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.6 "Noto Sans JP",system-ui,sans-serif;color:var(--ink);background:#eaf0f6}
+main{max-width:720px;margin:0 auto;padding:32px 18px}
+h1{font-size:22px;margin:0 0 4px}
+p{margin:0 0 18px;color:var(--mut)}
+#drop{display:block;border:2px dashed #9db2cf;border-radius:10px;padding:34px 16px;text-align:center;background:#f6f9fc;cursor:pointer}
+#drop.on,#drop:focus-within{border-color:var(--acc);background:#fff}
+input[type=file]{position:absolute;opacity:0;width:1px;height:1px}
+label.o{display:block;margin:14px 0}
+button{font:inherit;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;background:var(--acc);color:#fff}
+button:focus-visible,summary:focus-visible{outline:2px solid #8fb0ff;outline-offset:2px}
+#out{margin-top:16px}
+.bar{display:flex;gap:10px;align-items:center;margin-bottom:10px}
+details{background:#fff;border-radius:8px;margin-bottom:8px;padding:8px 12px}
+summary{cursor:pointer;display:flex;justify-content:space-between;gap:10px}
+pre{margin:8px 0 0;max-height:220px;overflow:auto;font:13px/1.6 ui-monospace,"Noto Sans Mono",monospace;white-space:pre-wrap}
+#err{color:#c4262e}
+</style>
+</head>
+<body>
+<main>
+<h1>MID → Aoudio Script</h1>
+<p>MIDI ファイルを .as(JavaScript)と .asl(音階リスト)に変換します。トラックごとに 1 つの .asl ができます。</p>
+<label id="drop"><input type="file" id="f" accept=".mid,.midi">MIDI ファイルをここにドロップ、またはクリックして選択</label>
+<label class="o"><input type="checkbox" id="drum" checked> ドラム(チャンネル10)を除く</label>
+<div id="err"></div>
+<div id="out"></div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const NM=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const nm=m=>NM[m%12]+(Math.floor(m/12)-1);
+const WAVES=['square','triangle','sawtooth','sine'];
+let last=null;
+
+function parseMidi(buf){
+  const d=new DataView(buf);let p=0;
+  const str=n=>{let s='';for(let i=0;i<n;i++)s+=String.fromCharCode(d.getUint8(p++));return s};
+  const u32=()=>{const v=d.getUint32(p);p+=4;return v},u16=()=>{const v=d.getUint16(p);p+=2;return v};
+  const vlq=()=>{let v=0,b;do{b=d.getUint8(p++);v=v<<7|b&127}while(b&128);return v};
+  if(str(4)!='MThd')throw Error('MIDI ファイルではありません');
+  u32();u16();const nt=u16(),div=u16();
+  if(div&0x8000)throw Error('SMPTE 形式の MIDI には未対応です');
+  let tempo=500000,set=false;const tracks=[];
+  for(let k=0;k<nt;k++){
+    if(str(4)!='MTrk')throw Error('トラックが壊れています');
+    const end=u32()+p,on={},notes=[];let t=0,run=0;
+    while(p<end){
+      t+=vlq();let s=d.getUint8(p);
+      if(s&128){p++;if(s<0xF0)run=s}else s=run;
+      if(s==0xFF){
+        const ty=d.getUint8(p++),l=vlq();
+        if(ty==0x51&&!set){tempo=d.getUint8(p)<<16|d.getUint8(p+1)<<8|d.getUint8(p+2);set=true}
+        p+=l;
+      }else if(s==0xF0||s==0xF7){p+=vlq()}
+      else{
+        const hi=s>>4,ch=s&15,a=d.getUint8(p++),b=(hi==0xC||hi==0xD)?0:d.getUint8(p++),key=ch*128+a;
+        if(hi==9&&b>0)on[key]=t;
+        else if((hi==8||hi==9)&&on[key]!=null){notes.push({s:on[key],e:t,m:a,ch});delete on[key]}
+      }
+    }
+    p=end;tracks.push(notes);
+  }
+  return{bpm:Math.round(6e7/tempo*100)/100,div,tracks};
+}
+
+function toASL(notes,div,drum,wave){
+  notes=notes.filter(n=>drum||n.ch!=9).sort((x,y)=>x.s-y.s||x.m-y.m);
+  if(!notes.length)return null;
+  const g=[];
+  for(const n of notes){const l=g[g.length-1];
+    if(l&&l.s==n.s){l.m.push(n.m);l.e=Math.max(l.e,n.e)}else g.push({s:n.s,e:n.e,m:[n.m]})}
+  const B=x=>+(x/div).toFixed(4),tok=[];let pos=0;
+  g.forEach((c,i)=>{
+    if(c.s>pos)tok.push('R:'+B(c.s-pos));
+    const len=Math.min(c.e,g[i+1]?g[i+1].s:c.e)-c.s;
+    if(len<=0)return;
+    tok.push(c.m.map(nm).join('+')+':'+B(len));pos=c.s+len;
+  });
+  const lines=['@wave '+wave,'@volume 0.2'];
+  for(let i=0;i<tok.length;i+=8)lines.push(tok.slice(i,i+8).join(' '));
+  return lines.join('\n')+'\n';
+}
+
+function convert(buf,base){
+  const m=parseMidi(buf),out=[],names=[];
+  m.tracks.forEach((tr,i)=>{
+    const a=toASL(tr,m.div,!$('drum').checked,WAVES[names.length%WAVES.length]);
+    if(!a)return;
+    const f=base+'_'+(names.length+1)+'.asl';names.push(f);out.push({name:f,text:a});
+  });
+  if(!names.length)throw Error('変換できる音符がありませんでした');
+  const as=['// '+base+'.mid から変換','tempo('+m.bpm+');','volume(0.2);',
+    ...names.map((f,i)=>'const t'+(i+1)+" = load('"+f+"');"),
+    'par('+names.map((_,i)=>'t'+(i+1)).join(', ')+');'].join('\n')+'\n';
+  out.unshift({name:base+'.as',text:as});
+  return out;
+}
+
+function show(files){
+  last=files;const o=$('out');o.replaceChildren();
+  const bar=document.createElement('div');bar.className='bar';
+  const all=document.createElement('button');all.textContent='フォルダに全部保存';all.onclick=saveAll;
+  const hint=document.createElement('span');hint.textContent=files.length+' ファイルができました';
+  bar.append(all,hint);o.append(bar);
+  for(const f of files){
+    const d=document.createElement('details'),s=document.createElement('summary'),b=document.createElement('button'),pre=document.createElement('pre');
+    const n=document.createElement('span');n.textContent=f.name;
+    b.textContent='ダウンロード';b.onclick=e=>{e.preventDefault();download(f)};
+    s.append(n,b);pre.textContent=f.text;d.append(s,pre);o.append(d);
+  }
+}
+function download(f){
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([f.text],{type:'text/plain'}));
+  a.download=f.name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+async function saveAll(){
+  if(!window.showDirectoryPicker){last.forEach((f,i)=>setTimeout(()=>download(f),i*250));return}
+  try{
+    const dir=await showDirectoryPicker({mode:'readwrite'});
+    for(const f of last){const w=await(await dir.getFileHandle(f.name,{create:true})).createWritable();await w.write(f.text);await w.close()}
+    $('err').textContent='';
+  }catch(e){if(e.name!='AbortError')$('err').textContent=e.message}
+}
+async function load(file){
+  $('err').textContent='';
+  try{show(convert(await file.arrayBuffer(),file.name.replace(/\.[^.]+$/,'')))}
+  catch(e){$('err').textContent=e.message;$('out').replaceChildren()}
+}
+$('f').onchange=e=>e.target.files[0]&&load(e.target.files[0]);
+const dz=$('drop');
+dz.ondragover=e=>{e.preventDefault();dz.classList.add('on')};
+dz.ondragleave=()=>dz.classList.remove('on');
+dz.ondrop=e=>{e.preventDefault();dz.classList.remove('on');e.dataTransfer.files[0]&&load(e.dataTransfer.files[0])};
+</script>
+</body>
+</html>
