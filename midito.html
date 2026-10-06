@@ -28,9 +28,10 @@ pre{margin:8px 0 0;max-height:220px;overflow:auto;font:13px/1.6 ui-monospace,"No
 <body>
 <main>
 <h1>MID → Aoudio Script</h1>
-<p>MIDI ファイルを .as(JavaScript)と .asl(音階リスト)に変換します。トラックごとに 1 つの .asl ができます。</p>
+<p>MIDI ファイルを .as(JavaScript)に変換します。全トラックを開始・長さ・ドラム・音高・楽器・音量の1行1音にまとめ、Scratch の音楽拡張と同じ楽器番号・ドラム番号で書き出します。</p>
 <label id="drop"><input type="file" id="f" accept=".mid,.midi">MIDI ファイルをここにドロップ、またはクリックして選択</label>
-<label class="o"><input type="checkbox" id="drum" checked> ドラム(チャンネル10)を除く</label>
+<label class="o"><input type="checkbox" id="drum" checked> ドラム(チャンネル10)も変換する</label>
+<label class="o"><input type="checkbox" id="sep"> 音符データを .asl に分けて出す(オフなら .as だけで鳴ります)</label>
 <div id="err"></div>
 <div id="out"></div>
 </main>
@@ -41,6 +42,9 @@ const nm=m=>NM[m%12]+(Math.floor(m/12)-1);
 const WAVES=['square','triangle','sawtooth','sine'];
 let last=null;
 
+const DRUM={35:2,36:2,38:1,40:1,37:3,39:8,42:6,44:6,46:5,49:4,52:4,55:4,57:4,51:5,53:5,59:5,41:14,43:14,45:14,47:13,48:13,50:13,54:7,56:11,75:9,76:10,77:10,81:12,80:12,73:16,74:16,69:15,70:15,58:17,78:18,79:18,60:13,61:13,62:14,63:14,64:14};
+const INST=p=>p>=4&&p<=7?2:p==11?16:p==12||p==13?19:p==45?7:p>=26&&p<=31?5:p>=52&&p<=54?15:p==55?21:p>=48&&p<=51?8:p==68||p==69||p==71?10:p==70?14:p>=75&&p<=77?13:[1,17,3,4,6,8,8,9,11,12,20,21,21,4,18,1][p>>3];
+
 function parseMidi(buf){
   const d=new DataView(buf);let p=0;
   const str=n=>{let s='';for(let i=0;i<n;i++)s+=String.fromCharCode(d.getUint8(p++));return s};
@@ -49,60 +53,55 @@ function parseMidi(buf){
   if(str(4)!='MThd')throw Error('MIDI ファイルではありません');
   u32();u16();const nt=u16(),div=u16();
   if(div&0x8000)throw Error('SMPTE 形式の MIDI には未対応です');
-  let tempo=500000,set=false;const tracks=[];
+  const tm=[],notes=[];
   for(let k=0;k<nt;k++){
     if(str(4)!='MTrk')throw Error('トラックが壊れています');
-    const end=u32()+p,on={},notes=[];let t=0,run=0;
+    const end=u32()+p,on={},prog={};let t=0,run=0;
     while(p<end){
       t+=vlq();let s=d.getUint8(p);
       if(s&128){p++;if(s<0xF0)run=s}else s=run;
       if(s==0xFF){
         const ty=d.getUint8(p++),l=vlq();
-        if(ty==0x51&&!set){tempo=d.getUint8(p)<<16|d.getUint8(p+1)<<8|d.getUint8(p+2);set=true}
+        if(ty==0x51)tm.push([t,d.getUint8(p)<<16|d.getUint8(p+1)<<8|d.getUint8(p+2)]);
         p+=l;
       }else if(s==0xF0||s==0xF7){p+=vlq()}
       else{
         const hi=s>>4,ch=s&15,a=d.getUint8(p++),b=(hi==0xC||hi==0xD)?0:d.getUint8(p++),key=ch*128+a;
-        if(hi==9&&b>0)on[key]=t;
-        else if((hi==8||hi==9)&&on[key]!=null){notes.push({s:on[key],e:t,m:a,ch});delete on[key]}
+        if(hi==0xC)prog[ch]=a;
+        else if(hi==9&&b>0){
+          if(on[key])notes.push({s:on[key][0],e:t,m:a,ch,v:on[key][1],i:on[key][2]});
+          on[key]=[t,b,prog[ch]||0];
+        }else if((hi==8||hi==9)&&on[key]){const o=on[key];notes.push({s:o[0],e:t,m:a,ch,v:o[1],i:o[2]});delete on[key]}
       }
     }
-    p=end;tracks.push(notes);
+    p=end;
   }
-  return{bpm:Math.round(6e7/tempo*100)/100,div,tracks};
+  tm.sort((x,y)=>x[0]-y[0]);
+  return{div,tm,notes};
 }
 
-function toASL(notes,div,drum,wave){
-  notes=notes.filter(n=>drum||n.ch!=9).sort((x,y)=>x.s-y.s||x.m-y.m);
-  if(!notes.length)return null;
-  const g=[];
-  for(const n of notes){const l=g[g.length-1];
-    if(l&&l.s==n.s){l.m.push(n.m);l.e=Math.max(l.e,n.e)}else g.push({s:n.s,e:n.e,m:[n.m]})}
-  const B=x=>+(x/div).toFixed(4),tok=[];let pos=0;
-  g.forEach((c,i)=>{
-    if(c.s>pos)tok.push('R:'+B(c.s-pos));
-    const len=Math.min(c.e,g[i+1]?g[i+1].s:c.e)-c.s;
-    if(len<=0)return;
-    tok.push(c.m.map(nm).join('+')+':'+B(len));pos=c.s+len;
-  });
-  const lines=['@wave '+wave,'@volume 0.2'];
-  for(let i=0;i<tok.length;i+=8)lines.push(tok.slice(i,i+8).join(' '));
-  return lines.join('\n')+'\n';
+function secFn(tm,div){
+  const pts=tm.length&&tm[0][0]==0?tm:[[0,500000],...tm],seg=[];
+  let sec=0,pt=0,us=500000;
+  for(const [tk,u] of pts){sec+=(tk-pt)*us/div/1e6;pt=tk;us=u;seg.push([tk,sec,u])}
+  return tick=>{let g=seg[0];for(const x of seg){if(x[0]<=tick)g=x;else break}return g[1]+(tick-g[0])*g[2]/div/1e6};
 }
 
-function convert(buf,base){
-  const m=parseMidi(buf),out=[],names=[];
-  m.tracks.forEach((tr,i)=>{
-    const a=toASL(tr,m.div,!$('drum').checked,WAVES[names.length%WAVES.length]);
-    if(!a)return;
-    const f=base+'_'+(names.length+1)+'.asl';names.push(f);out.push({name:f,text:a});
-  });
-  if(!names.length)throw Error('変換できる音符がありませんでした');
-  const as=['// '+base+'.mid から変換','tempo('+m.bpm+');','volume(0.2);',
-    ...names.map((f,i)=>'const t'+(i+1)+" = load('"+f+"');"),
-    'par('+names.map((_,i)=>'t'+(i+1)).join(', ')+');'].join('\n')+'\n';
-  out.unshift({name:base+'.as',text:as});
-  return out;
+function convert(buf,base,drums,sep){
+  const m=parseMidi(buf),S=secFn(m.tm,m.div),ev=[];
+  for(const n of m.notes){
+    const isD=n.ch==9;let p=n.m;
+    if(isD){if(!drums||!DRUM[p])continue;p=DRUM[p]}
+    const s=S(n.s);
+    ev.push([s,Math.max(S(n.e)-s,0.01),isD?1:0,p,isD?1:INST(n.i),Math.max(1,Math.round(n.v/127*100))]);
+  }
+  if(!ev.length)throw Error('変換できる音符がありませんでした');
+  ev.sort((a,b)=>a[0]-b[0]||a[3]-b[3]);
+  const r=x=>+x.toFixed(4),bpm=Math.round(6e7/(m.tm[0]?m.tm[0][1]:500000)*100)/100;
+  const head='; '+base+'.mid から変換\n; 開始秒 長さ秒 ドラム 音高 楽器 音量\n@bpm '+bpm+'\n';
+  const rows=ev.map(e=>[r(e[0]),r(e[1]),e[2],e[3],e[4],e[5]].join(' ')).join('\n')+'\n';
+  if(sep)return[{name:base+'.as',text:'// '+base+'.mid から変換\nsetTempo('+bpm+');\nplay(load('+JSON.stringify(base+'.asl')+'));\n'},{name:base+'.asl',text:head+rows}];
+  return[{name:base+'.as',text:'// '+base+'.mid から変換 (音符データを中に含みます。.asl は不要です)\nsetTempo('+bpm+');\nplay(asl(`\n'+head+rows+'`));\n'}];
 }
 
 function show(files){
@@ -132,7 +131,7 @@ async function saveAll(){
 }
 async function load(file){
   $('err').textContent='';
-  try{show(convert(await file.arrayBuffer(),file.name.replace(/\.[^.]+$/,'')))}
+  try{show(convert(await file.arrayBuffer(),file.name.replace(/\.[^.]+$/,''),$('drum').checked,$('sep').checked))}
   catch(e){$('err').textContent=e.message;$('out').replaceChildren()}
 }
 $('f').onchange=e=>e.target.files[0]&&load(e.target.files[0]);
